@@ -1,1 +1,0 @@
-Review the documentation file in the planning folder called $ARGUMENTS. Write your feedback to planning/CLAUDE_DOC_REVIEW.md and add questions, clarifications or feedback, along with any opportunities to simplify.
