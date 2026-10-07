@@ -1,5 +1,7 @@
 # Market Data Interface
 
+> **Superseded:** implement from [MARKET_DATA_DESIGN.md](MARKET_DATA_DESIGN.md). The code below is an earlier draft; §14 there lists what changed and why.
+
 The unified Python API FinAlly uses for stock prices. The backend talks to one interface, `MarketDataSource`, and gets its prices from one shared `PriceCache`. A factory picks the implementation at startup:
 
 - `MASSIVE_API_KEY` set and non-empty → `MassiveDataSource` (real data, REST polling)
