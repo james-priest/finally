@@ -1,5 +1,7 @@
 # Market Simulator
 
+> **Superseded:** implement from [MARKET_DATA_DESIGN.md](MARKET_DATA_DESIGN.md) §9. The code below is an earlier draft; the model and its derivations still apply.
+
 How FinAlly makes up realistic-looking live prices when no `MASSIVE_API_KEY` is set. This is the default mode. The simulator implements `MarketDataSource` from [MARKET_INTERFACE.md](MARKET_INTERFACE.md) and writes into the same `PriceCache` the Massive source uses, so nothing downstream can tell which one is running.
 
 ## 1. Goals

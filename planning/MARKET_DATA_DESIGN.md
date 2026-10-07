@@ -6,7 +6,7 @@ The implementation spec for FinAlly's market data subsystem (PLAN.md §6): one i
 
 **Verification.** All code here was run, not just written, on Python 3.12 with FastAPI 0.142.2 and massive 2.8.0:
 
-- The 55 tests in Appendix A pass with no network or API key. Each fix in §14 (F1–F6) was mutation-checked: putting the old behavior back makes its test fail.
+- The 57 tests in Appendix A pass with no network or API key. Each fix in §14 (F1–F6) was mutation-checked: putting the old behavior back makes its test fail.
 - The Massive source was driven through the real `RESTClient` over HTTP against a fake server answering as the Starter and the free plan would.
 - The SSE endpoint was checked under uvicorn with curl.
 - The code blocks were extracted from this document and the suite re-run against them.
@@ -407,10 +407,10 @@ def _poll_seconds() -> float:
     return value
 ```
 
-| Env var                | Default | Effect                                                                                                                                                                                                                |
-| ---------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MASSIVE_API_KEY`      | empty   | Non-empty → Massive; empty or whitespace → simulator                                                                                                                                                                  |
-| `MASSIVE_POLL_SECONDS` | `15`    | Snapshot poll interval, at least 1, and the base of the retry backoff. Starter plans and up have unlimited calls, so 2–5 is fine. EOD mode refreshes hourly regardless. Bad values log a warning and fall back to 15. |
+| Env var                | Default | Effect                                                                                                                                                                                                                                                                                           |
+| ---------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `MASSIVE_API_KEY`      | empty   | Non-empty → Massive; empty or whitespace → simulator                                                                                                                                                                                                                                             |
+| `MASSIVE_POLL_SECONDS` | `15`    | Snapshot poll interval, at least 1, and the base of the retry backoff. Starter plans and up have unlimited calls, so 2–5 is fine. EOD mode refreshes hourly and retries at most once a minute, so a low value left over after a downgrade is safe. Bad values log a warning and fall back to 15. |
 
 Add `MASSIVE_POLL_SECONDS=` to `.env.example` as optional. The factory reads `os.environ` when it runs, so `.env` must already be loaded: Docker's `--env-file` does this; locally, use `uv run --env-file ../.env ...`.
 
@@ -699,6 +699,7 @@ from .cache import PriceCache
 logger = logging.getLogger(__name__)
 
 EOD_POLL_SECONDS = 3600.0  # free plan: closes change once a day
+EOD_MIN_RETRY_SECONDS = 60.0  # free plan: 5 calls/min, so retry at most once a minute
 MAX_BACKOFF_SECONDS = 300.0  # longest wait between attempts after repeated failures
 MAX_EOD_LOOKUPS = 4  # grouped-daily calls per EOD refresh; the free plan allows 5 calls/min
 
@@ -809,9 +810,12 @@ class MassiveDataSource(MarketDataSource):
             await self._refresh()
 
     def _next_delay(self) -> float:
-        if self._failures:
-            return min(self._poll_seconds * 2**self._failures, MAX_BACKOFF_SECONDS)
-        return EOD_POLL_SECONDS if self._eod_mode else self._poll_seconds
+        if not self._failures:
+            return EOD_POLL_SECONDS if self._eod_mode else self._poll_seconds
+        delay = min(self._poll_seconds * 2**self._failures, MAX_BACKOFF_SECONDS)
+        if self._eod_mode:  # also covers a low MASSIVE_POLL_SECONDS left over from a paid plan
+            delay = max(delay, EOD_MIN_RETRY_SECONDS)
+        return delay
 
     async def _refresh(self, tickers: Sequence[str] | None = None) -> None:
         """Poll once. Failures are logged and counted, never raised, so the loop never dies."""
@@ -912,7 +916,7 @@ class MassiveDataSource(MarketDataSource):
 | No EOD data within 4 lookups                 | `EndOfDayDataMissing`                                     | Logged, retried with backoff                         |
 | Anything else (a bug, an unexpected payload) | any other `Exception`                                     | Logged with traceback, retried with backoff          |
 
-Backoff is `poll_seconds × 2^failures`, capped at 5 minutes: 30s, 60s, 120s, 240s, then 300s with the default 15s. The first success resets it and logs a recovery line. The cache keeps the last good prices throughout. On shutdown, `CancelledError` is not an `Exception`, so it passes straight through.
+Backoff is `poll_seconds × 2^failures`, capped at 5 minutes: 30s, 60s, 120s, 240s, then 300s with the default 15s. In EOD mode retries are also at least 60s apart, because the free plan allows 5 calls a minute: a `MASSIVE_POLL_SECONDS` of 2 kept from a paid plan would otherwise retry after 4s, 8s and 16s. The first success resets the backoff and logs a recovery line. The cache keeps the last good prices throughout. On shutdown, `CancelledError` is not an `Exception`, so it passes straight through.
 
 ### 10.5 Design Notes
 
@@ -923,6 +927,24 @@ Backoff is `poll_seconds × 2^failures`, capped at 5 minutes: 30s, 60s, 120s, 24
 - **`us_market_today()`** approximates New York as UTC−5. That is never ahead of the real date (daylight time is UTC−4), and the walk only needs "not in the future", so the slim Docker image needs no time zone database.
 - **The key is passed explicitly** to `RESTClient`. The client's default reads the env var at import time, possibly before `.env` is loaded.
 - **Snapshot price fallback order:** last trade, minute bar close, day bar close, previous close. Starter has no last trade, and bars are reset overnight, so early-morning polls fall back to `prevDay.c`.
+
+### 10.6 Switching Plans
+
+No setting describes the plan. The source works it out from Massive's responses, so `.env` cannot disagree with the real subscription.
+
+| Change                     | What happens                                                                                         | What to do                                                                                                                                                                                                                                               |
+| -------------------------- | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Downgrade to the free plan | The next snapshot poll gets `403 NOT_AUTHORIZED`, and the source switches to EOD mode while running. | Nothing. Check that `/api/health` shows `"mode": "eod"`; if it doesn't, the 403 wording differs from what `is_not_authorized` expects (§15). Consider removing `MASSIVE_API_KEY` to use the simulator, since the free plan only has static daily closes. |
+| Upgrade to a paid plan     | EOD mode is sticky.                                                                                  | Restart the app. Optionally lower `MASSIVE_POLL_SECONDS` to 2–5.                                                                                                                                                                                         |
+
+A plan variable would only add a way to be wrong. Set to "paid" on a free key, the snapshot calls still fail, so the fallback is needed anyway. Set to "free" on a paid key, the app would show static daily closes while you pay for live data.
+
+`.env` on a paid plan, for example:
+
+```bash
+MASSIVE_API_KEY=your-key
+MASSIVE_POLL_SECONDS=5
+```
 
 ## 11. FastAPI Integration
 
@@ -1189,16 +1211,16 @@ async def health(source: MarketSourceDep) -> dict:
 
 ```bash
 cd backend
-uv run pytest    # 55 tests in about 2.5s; no network or API key needed
+uv run pytest    # 57 tests in about 3s; no network or API key needed
 ```
 
-| File                | Covers                                                                                                                                                                                                                                                                                                                       |
-| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `test_cache.py`     | previous price, direction and rounding; `prev_close` carry-forward; invalid prices; `version`; the SSE dict shape; `wait_for_change` (immediate return, wake-up on change)                                                                                                                                                   |
-| `test_interface.py` | `normalize_ticker`; factory selection and `MASSIVE_POLL_SECONDS` parsing; `sync_tickers`                                                                                                                                                                                                                                     |
-| `test_simulator.py` | unknown-ticker profiles; determinism with a seed; parked prices; volatility and correlations against the model (20k ticks, fixed seed); jump rate; source start, add, remove and stop                                                                                                                                        |
-| `test_massive.py`   | no hidden client retries; snapshot price fallback; 403 detection; one call per poll; immediate pricing on add; the in-flight removal race; free-plan EOD fallback (exact call sequence); holidays and 403 days; a single EOD session; the lookup cap; backoff and recovery; the loop surviving network and unexpected errors |
-| `test_stream.py`    | real uvicorn and httpx: headers, `retry`, full state on connect, an event per change, removed tickers dropping out                                                                                                                                                                                                           |
+| File                | Covers                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `test_cache.py`     | previous price, direction and rounding; `prev_close` carry-forward; invalid prices; `version`; the SSE dict shape; `wait_for_change` (immediate return, wake-up on change)                                                                                                                                                                                                                      |
+| `test_interface.py` | `normalize_ticker`; factory selection and `MASSIVE_POLL_SECONDS` parsing; `sync_tickers`                                                                                                                                                                                                                                                                                                        |
+| `test_simulator.py` | unknown-ticker profiles; determinism with a seed; parked prices; volatility and correlations against the model (20k ticks, fixed seed); jump rate; source start, add, remove and stop                                                                                                                                                                                                           |
+| `test_massive.py`   | no hidden client retries; snapshot price fallback; 403 detection; one call per poll; immediate pricing on add; the in-flight removal race; free-plan EOD fallback (exact call sequence); holidays and 403 days; a single EOD session; the lookup cap; backoff and recovery; a downgrade while running; the free plan's one-minute retry floor; the loop surviving network and unexpected errors |
+| `test_stream.py`    | real uvicorn and httpx: headers, `retry`, full state on connect, an event per change, removed tickers dropping out                                                                                                                                                                                                                                                                              |
 
 The Massive tests pass a `FakeClient` through the `client=` parameter, so they need no network. The statistical tests use fixed seeds and are deterministic. The full suite is in Appendix A.
 
@@ -1238,18 +1260,18 @@ Unchanged from MARKET_INTERFACE.md and MARKET_SIMULATOR.md: the `PriceUpdate` fi
 
 **Design changes:**
 
-| #   | Earlier                                                                                                                  | Now                                                                       | Why                                                                                                                 |
-| --- | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| D1  | `add_ticker` and `remove_ticker` were synchronous; on Massive a new ticker had no price until the next poll (up to 15s). | Coroutines; Massive fetches a new ticker straight away.                   | "Add PYPL and buy 10 shares" from chat otherwise fails with 400 on Massive.                                         |
-| D2  | Callers paired adds and removes by hand (four rules).                                                                    | `sync_tickers(watchlist ∪ open positions)`.                               | One idempotent call; any drift is repaired by the next one.                                                         |
-| D3  | The SSE loop sampled the cache every 500ms.                                                                              | It waits on `cache.wait_for_change()`.                                    | Ticks no longer arrive up to 500ms late (measured 45, 261 and 453ms against 0.1ms); the cadence follows the source. |
-| D4  | Browser's default reconnect delay.                                                                                       | `retry: 1000` on the first event.                                         | Reconnects after 1s.                                                                                                |
-| D5  | Errors retried every 15s.                                                                                                | Exponential backoff up to 5 minutes, plus `status()` in `/api/health`.    | No log spam with a bad key, and the reason prices are missing is visible.                                           |
-| D6  | Re-adding a ticker to the simulator restarted it at the seed price.                                                      | Removed tickers park their last price; `prev_close` stays the seed price. | No jump back after a remove and re-add.                                                                             |
-| D7  | The cache accepted any float.                                                                                            | It rejects zero, negative, NaN and infinite prices.                       | One NaN would make every SSE event invalid JSON.                                                                    |
-| D8  | No ticker validation.                                                                                                    | `normalize_ticker` at the API boundary.                                   | Massive is case-sensitive, and the simulator prices anything.                                                       |
-| D9  | Tests replaced `source._client`.                                                                                         | `MassiveDataSource(..., client=...)`.                                     | An explicit seam for fakes.                                                                                         |
-| D10 | `profile_for()` ran for every ticker on every tick; a failing tick ended the simulator task.                             | Profiles are cached when a ticker is added; tick errors are logged.       | Less work per tick, and the same "never die" rule as Massive.                                                       |
+| #   | Earlier                                                                                                                  | Now                                                                                                          | Why                                                                                                                                |
+| --- | ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| D1  | `add_ticker` and `remove_ticker` were synchronous; on Massive a new ticker had no price until the next poll (up to 15s). | Coroutines; Massive fetches a new ticker straight away.                                                      | "Add PYPL and buy 10 shares" from chat otherwise fails with 400 on Massive.                                                        |
+| D2  | Callers paired adds and removes by hand (four rules).                                                                    | `sync_tickers(watchlist ∪ open positions)`.                                                                  | One idempotent call; any drift is repaired by the next one.                                                                        |
+| D3  | The SSE loop sampled the cache every 500ms.                                                                              | It waits on `cache.wait_for_change()`.                                                                       | Ticks no longer arrive up to 500ms late (measured 45, 261 and 453ms against 0.1ms); the cadence follows the source.                |
+| D4  | Browser's default reconnect delay.                                                                                       | `retry: 1000` on the first event.                                                                            | Reconnects after 1s.                                                                                                               |
+| D5  | Errors retried every 15s.                                                                                                | Exponential backoff up to 5 minutes (at least 60s apart on the free plan), plus `status()` in `/api/health`. | No log spam with a bad key, no burst of retries against the free plan's 5 calls/min, and the reason prices are missing is visible. |
+| D6  | Re-adding a ticker to the simulator restarted it at the seed price.                                                      | Removed tickers park their last price; `prev_close` stays the seed price.                                    | No jump back after a remove and re-add.                                                                                            |
+| D7  | The cache accepted any float.                                                                                            | It rejects zero, negative, NaN and infinite prices.                                                          | One NaN would make every SSE event invalid JSON.                                                                                   |
+| D8  | No ticker validation.                                                                                                    | `normalize_ticker` at the API boundary.                                                                      | Massive is case-sensitive, and the simulator prices anything.                                                                      |
+| D9  | Tests replaced `source._client`.                                                                                         | `MassiveDataSource(..., client=...)`.                                                                        | An explicit seam for fakes.                                                                                                        |
+| D10 | `profile_for()` ran for every ticker on every tick; a failing tick ended the simulator task.                             | Profiles are cached when a ticker is added; tick errors are logged.                                          | Less work per tick, and the same "never die" rule as Massive.                                                                      |
 
 ## 15. Known Limitations
 
@@ -1716,6 +1738,26 @@ async def test_failures_back_off_and_recover():
     await source._refresh()
     assert source._next_delay() == 15
     assert source.status()["last_error"] is None
+    await source.stop()
+
+
+async def test_downgrade_while_running_switches_to_eod(monday):
+    client = FakeClient([snap("AAPL", minute=191.5)], grouped={"2026-10-02": bars(AAPL=192.0)})
+    cache = PriceCache()
+    source = MassiveDataSource(cache, "key", poll_seconds=2, client=client)  # fast polling on a paid plan
+    await source.start(["AAPL"])
+    client.snapshot_error = BadResponse(NOT_AUTHORIZED)  # the plan is downgraded
+    await source._refresh()  # the next background poll
+    assert source.status()["mode"] == "eod"
+    assert cache.get_price("AAPL") == 192.0
+    await source.stop()
+
+
+async def test_free_plan_retries_at_most_once_a_minute(monday):
+    client = FakeClient(snapshot_error=BadResponse(NOT_AUTHORIZED))  # no EOD data either: refreshes fail
+    source = MassiveDataSource(PriceCache(), "key", poll_seconds=2, client=client)  # left over from a paid plan
+    await source.start(["AAPL"])
+    assert source._next_delay() == 60  # not 4s: the free plan allows 5 calls a minute
     await source.stop()
 
 
