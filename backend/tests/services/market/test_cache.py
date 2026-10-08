@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 
@@ -70,3 +71,22 @@ async def test_wait_for_change_wakes_on_update():
     assert not waiter.done()
     cache.update("AAPL", 190.0)
     assert await asyncio.wait_for(waiter, 1) == 1
+
+
+def test_rounds_before_validating():
+    cache = PriceCache()
+    with pytest.raises(ValueError):
+        cache.update("PENNY", 0.00004)  # positive, but 0 once rounded
+    assert cache.update("PENNY", 0.004).price == 0.004  # sub-dollar prices keep 4 decimals
+    assert cache.update("PENNY", 0.45678).price == 0.4568
+    assert cache.update("AAPL", 190.456).price == 190.46
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 0.0, -5.0])
+def test_unusable_prev_close_carries_forward(bad):
+    cache = PriceCache()
+    assert cache.update("AAPL", 190.0, prev_close=bad).prev_close == 190.0  # first update: its own price
+    cache.update("AAPL", 191.0, prev_close=189.0)
+    update = cache.update("AAPL", 192.0, prev_close=bad)
+    assert update.prev_close == 189.0
+    json.dumps(update.to_dict(), allow_nan=False)  # what the browser's JSON.parse accepts

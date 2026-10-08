@@ -20,6 +20,7 @@ EOD_POLL_SECONDS = 3600.0  # free plan: closes change once a day
 EOD_MIN_RETRY_SECONDS = 60.0  # free plan: 5 calls/min, so retry at most once a minute
 MAX_BACKOFF_SECONDS = 300.0  # longest wait between attempts after repeated failures
 MAX_EOD_LOOKUPS = 4  # grouped-daily calls per EOD refresh; the free plan allows 5 calls/min
+ADD_WAIT_SECONDS = 3.0  # longest a caller of add_ticker/sync_tickers waits for a new ticker's price
 
 
 class EndOfDayDataMissing(Exception):
@@ -72,9 +73,7 @@ class MassiveDataSource(MarketDataSource):
         self._cache = cache
         # retries=0: the poll loop is the retry policy. The client's own retries obey
         # Retry-After on 429s, which can block a worker thread for minutes.
-        self._client = client or RESTClient(
-            api_key=api_key, connect_timeout=5.0, read_timeout=10.0, retries=0
-        )
+        self._client = client or RESTClient(api_key=api_key, connect_timeout=5.0, read_timeout=10.0, retries=0)
         self._poll_seconds = poll_seconds
         self._tickers: set[str] = set()
         self._eod_mode = False
@@ -83,6 +82,10 @@ class MassiveDataSource(MarketDataSource):
         self._last_success: float | None = None
         self._last_error: str | None = None
         self._task: asyncio.Task | None = None
+        # One refresh at a time: polls and add_ticker never overlap their API calls,
+        # and a plan downgrade switches to EOD mode exactly once.
+        self._lock = asyncio.Lock()
+        self._pricing: set[asyncio.Task] = set()  # add_ticker refreshes that outlived their wait
 
     async def start(self, tickers: Iterable[str]) -> None:
         self._tickers.update(tickers)
@@ -91,20 +94,45 @@ class MassiveDataSource(MarketDataSource):
             self._task = asyncio.create_task(self._run(), name="massive-poller")
 
     async def stop(self) -> None:
-        if self._task:
-            self._task.cancel()
+        tasks = [*self._pricing, *([self._task] if self._task else [])]
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
             with suppress(asyncio.CancelledError):
-                await self._task
-            self._task = None
+                await task
+        self._task = None
 
     async def add_ticker(self, ticker: str) -> None:
-        if ticker in self._tickers:
+        await self._add([ticker])
+
+    async def sync_tickers(self, tickers: Iterable[str]) -> None:
+        """Like the base version, but prices all new tickers with a single snapshot call."""
+        wanted = set(tickers)
+        for ticker in sorted(self._tickers - wanted):
+            await self.remove_ticker(ticker)
+        await self._add(sorted(wanted - self._tickers))
+
+    async def _add(self, tickers: Sequence[str]) -> None:
+        new = sorted(set(tickers) - self._tickers)
+        if not new:
             return
-        self._tickers.add(ticker)
+        self._tickers.update(new)
         if self._eod_mode:
-            self._write_eod(ticker)  # from the stored EOD data, no API call
-        else:
-            await self._refresh([ticker])  # one snapshot call, so the price is there right away
+            for ticker in new:
+                self._write_eod(ticker)  # from the stored EOD data, no API call
+        elif not self._failures:  # while the API is failing, the background poll prices them
+            await self._price_soon(new)
+
+    async def _price_soon(self, tickers: Sequence[str]) -> None:
+        """Fetch prices for new tickers, waiting at most ADD_WAIT_SECONDS.
+
+        A slow call keeps running in the background and writes its prices when it
+        returns, so a hung API never holds up a watchlist change or a trade for long.
+        """
+        task = asyncio.create_task(self._refresh(tickers), name="massive-add")
+        self._pricing.add(task)
+        task.add_done_callback(self._pricing.discard)
+        await asyncio.wait([task], timeout=ADD_WAIT_SECONDS)
 
     async def remove_ticker(self, ticker: str) -> None:
         self._tickers.discard(ticker)
@@ -136,7 +164,16 @@ class MassiveDataSource(MarketDataSource):
         return delay
 
     async def _refresh(self, tickers: Sequence[str] | None = None) -> None:
-        """Poll once. Failures are logged and counted, never raised, so the loop never dies."""
+        """Poll once: every tracked ticker, or just `tickers`. Never raises, so the loop never dies."""
+        async with self._lock:
+            if tickers is not None and self._eod_mode:
+                # Switched to EOD mode while this call waited for the lock: no API call needed.
+                for ticker in tickers:
+                    self._write_eod(ticker)
+                return
+            await self._refresh_locked(tickers)
+
+    async def _refresh_locked(self, tickers: Sequence[str] | None) -> None:
         try:
             if self._eod_mode:
                 await self._poll_eod()
@@ -146,7 +183,7 @@ class MassiveDataSource(MarketDataSource):
             if not self._eod_mode and is_not_authorized(e):
                 logger.warning("Massive plan has no snapshot access; using end-of-day prices")
                 self._eod_mode = True
-                await self._refresh()
+                await self._refresh_locked(None)
                 return
             self._record_failure(f"Massive API error: {e}")
         except (HTTPError, EndOfDayDataMissing) as e:  # HTTPError: network, timeout, 429/5xx
@@ -160,9 +197,7 @@ class MassiveDataSource(MarketDataSource):
     async def _poll_snapshot(self, tickers: Sequence[str]) -> None:
         if not tickers:
             return
-        snapshots = await asyncio.to_thread(
-            self._client.get_snapshot_all, "stocks", tickers=list(tickers)
-        )
+        snapshots = await asyncio.to_thread(self._client.get_snapshot_all, "stocks", tickers=list(tickers))
         for snap in snapshots:
             price = snapshot_price(snap)
             if price is None or snap.ticker not in self._tickers:

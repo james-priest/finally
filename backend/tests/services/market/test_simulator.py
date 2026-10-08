@@ -104,3 +104,49 @@ async def test_stop_halts_ticks_and_is_idempotent():
     version = cache.version
     await asyncio.sleep(0.03)
     assert cache.version == version
+
+
+async def test_re_added_ticker_resumes_its_price_and_keeps_the_seed_as_prev_close():
+    cache = PriceCache()
+    source = SimulatorDataSource(cache, simulator=GBMSimulator(rng=random.Random(3)), tick_seconds=60)
+    await source.start(["AAPL"])
+    for _ in range(50):
+        source._sim.step()
+    last = source._sim.step()["AAPL"]
+    await source.remove_ticker("AAPL")
+    await source.add_ticker("AAPL")
+    update = cache.get("AAPL")
+    assert update.price == round(last, 2)  # no jump back to the seed price
+    assert update.prev_close == 190.0  # day change is still measured from the seed price
+    await source.stop()
+
+
+async def test_source_survives_a_failing_tick():
+    class FlakySimulator(GBMSimulator):
+        failed = False
+
+        def step(self):
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("boom")
+            return super().step()
+
+    cache = PriceCache()
+    source = SimulatorDataSource(cache, tick_seconds=0.01, simulator=FlakySimulator(tick_seconds=0.01))
+    await source.start(["AAPL"])
+    await asyncio.sleep(0.1)
+    assert source._sim.failed
+    assert cache.version > 3  # ticks carried on after the failure
+    await source.stop()
+
+
+async def test_start_twice_runs_one_task_and_add_ticker_is_idempotent():
+    cache = PriceCache()
+    source = SimulatorDataSource(cache, tick_seconds=60)
+    await source.start(["AAPL"])
+    await source.start(["AAPL"])
+    assert sum(t.get_name() == "market-simulator" for t in asyncio.all_tasks()) == 1
+    version = cache.version
+    await source.add_ticker("AAPL")
+    assert cache.version == version  # already tracked: no new cache write
+    await source.stop()

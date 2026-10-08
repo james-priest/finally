@@ -102,11 +102,7 @@ class GBMSimulator:
             p = self._profiles[ticker]
             if p.sector not in sectors:
                 sectors[p.sector] = rng.gauss(0.0, 1.0)
-            z = (
-                self._market_w * market
-                + self._sector_w * sectors[p.sector]
-                + self._own_w * rng.gauss(0.0, 1.0)
-            )
+            z = self._market_w * market + self._sector_w * sectors[p.sector] + self._own_w * rng.gauss(0.0, 1.0)
             log_return = (p.drift - 0.5 * p.volatility**2) * self.dt + p.volatility * self._sqrt_dt * z
             if rng.random() < self._event_probability:
                 log_return += math.log1p(rng.choice((-1, 1)) * rng.uniform(0.02, 0.05))

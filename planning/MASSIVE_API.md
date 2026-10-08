@@ -2,7 +2,7 @@
 
 Reference for the parts of the Massive REST API that FinAlly uses: current prices for many tickers at once, and end-of-day (EOD) prices. Researched October 2026 against the official docs (`massive.com/docs`) and the official Python client `massive` v2.8.0.
 
-How FinAlly wraps this API is described in [MARKET_INTERFACE.md](MARKET_INTERFACE.md).
+How FinAlly wraps this API is described in [MARKET_DATA_DESIGN.md](MARKET_DATA_DESIGN.md) §10, and the code in `backend/app/services/market/massive.py` is the source of truth. The code samples below are API reference only: FinAlly deliberately does some things differently, as noted.
 
 ## 1. Overview
 
@@ -185,6 +185,8 @@ Returns OHLCV for **every** US stock for one trading day. Available on the free 
 }
 ```
 
+> **Reference only — do not copy.** This sketch starts at today, steps back one calendar day per call and assumes two sessions are found. FinAlly's version starts at yesterday (New York), skips weekends without a call, passes over 403 days, stops after 4 lookups and copes with fewer than two sessions (MARKET_DATA_DESIGN.md §10.2, fixes F2 and F3).
+
 ```python
 from datetime import date, timedelta
 
@@ -238,6 +240,8 @@ for bar in client.list_aggs("AAPL", 5, "minute", "2026-10-05", "2026-10-05", lim
 FinAlly does not need this yet, because sparklines are built from the SSE stream. It is listed here in case pre-filled charts are wanted later.
 
 ## 6. Python Client Notes
+
+The defaults are shown below. FinAlly uses `connect_timeout=5.0`, `read_timeout=10.0` and **`retries=0`**: the client's retries honor `Retry-After` on 429, which blocked a call for 6s and sent 4 requests in a test, and they spend the free plan's 5 calls/min (MARKET_DATA_DESIGN.md §10.5, fix F5).
 
 ```python
 from massive import RESTClient
