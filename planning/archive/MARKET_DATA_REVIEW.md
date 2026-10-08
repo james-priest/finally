@@ -1,6 +1,8 @@
 # Market Data Backend: Code Review
 
-Review of the market data subsystem merged in PR #5 (commit `843f184`): `backend/app/services/market/`, `backend/app/routes/stream.py`, `backend/app/dependencies.py`, `backend/app/main.py`, and the tests under `backend/tests/`. Reviewed against PLAN.md §6 and [MARKET_DATA_DESIGN.md](MARKET_DATA_DESIGN.md), with [MASSIVE_API.md](MASSIVE_API.md), [MARKET_INTERFACE.md](MARKET_INTERFACE.md) and [MARKET_SIMULATOR.md](MARKET_SIMULATOR.md) as background.
+> **Archived — complete.** Every action below was carried out in PR #8 (see the Resolution section at the end). For the current state read [MARKET_DATA_SUMMARY.md](../MARKET_DATA_SUMMARY.md) and `backend/CLAUDE.md`. Line numbers and test counts here describe the code as it was reviewed.
+
+Review of the market data subsystem merged in PR #5 (commit `843f184`): `backend/app/services/market/`, `backend/app/routes/stream.py`, `backend/app/dependencies.py`, `backend/app/main.py`, and the tests under `backend/tests/`. Reviewed against PLAN.md §6 and [MARKET_DATA_DESIGN.md](../MARKET_DATA_DESIGN.md), with [MASSIVE_API.md](../MASSIVE_API.md), [MARKET_INTERFACE.md](MARKET_INTERFACE.md) and [MARKET_SIMULATOR.md](MARKET_SIMULATOR.md) as background.
 
 Date: 2026-10-08 · Python 3.12.14, FastAPI 0.142.2, Starlette 1.7.0, uvicorn 0.54.0, massive 2.8.0, pytest 9.1.1
 
