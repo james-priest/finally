@@ -5,6 +5,15 @@ import time
 from .models import PriceUpdate
 
 
+def round_price(price: float) -> float:
+    """Cents, or 4 decimals below $1 so sub-dollar stocks keep their precision."""
+    return round(price, 2 if price >= 1 else 4)
+
+
+def _is_valid(price: float) -> bool:
+    return math.isfinite(price) and price > 0
+
+
 class PriceCache:
     """Latest price per ticker. Written by the market data source, read by everyone else.
 
@@ -25,18 +34,24 @@ class PriceCache:
         prev_close: float | None = None,
         timestamp: float | None = None,
     ) -> PriceUpdate:
-        """Store a new price. The old price becomes previous_price."""
-        if not (math.isfinite(price) and price > 0):
+        """Store a new price. The old price becomes previous_price.
+
+        Raises ValueError for a price that is not positive and finite after rounding.
+        An unusable prev_close (None, zero, negative, NaN, infinite) carries the stored one forward.
+        """
+        price = round_price(price)  # NaN and infinity pass through round() unchanged
+        if not _is_valid(price):
             raise ValueError(f"Invalid price for {ticker}: {price!r}")
         old = self._prices.get(ticker)
-        price = round(price, 2)
-        if prev_close is None:
+        if prev_close is not None:
+            prev_close = round_price(prev_close)
+        if prev_close is None or not _is_valid(prev_close):
             prev_close = old.prev_close if old else price
         update = PriceUpdate(
             ticker=ticker,
             price=price,
             previous_price=old.price if old else price,
-            prev_close=round(prev_close, 2),
+            prev_close=prev_close,
             timestamp=time.time() if timestamp is None else timestamp,
         )
         self._prices[ticker] = update

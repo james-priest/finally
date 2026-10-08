@@ -397,7 +397,7 @@ Stage 2: Python 3.12 slim
   - uv sync (install Python dependencies from lockfile)
   - Copy frontend build output into a static/ directory
   - Expose port 8000
-  - CMD: uvicorn serving FastAPI app
+  - CMD: uvicorn serving FastAPI app: `uvicorn app.main:app --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 2` (the timeout lets shutdown finish while browsers hold SSE streams open; see MARKET_DATA_DESIGN.md §11.1)
 ```
 
 FastAPI serves the static frontend files and all API routes on port 8000.

@@ -4,6 +4,8 @@ The implementation spec for FinAlly's market data subsystem (PLAN.md §6): one i
 
 **How it relates to the other planning docs.** This document merges [MARKET_INTERFACE.md](MARKET_INTERFACE.md) and [MARKET_SIMULATOR.md](MARKET_SIMULATOR.md) into one buildable design and **supersedes their code where they differ**. §14 lists every change and why. [MASSIVE_API.md](MASSIVE_API.md) remains the reference for Massive endpoints, plans and the Python client, and MARKET_SIMULATOR.md for the simulator's derivations.
 
+**Status: implemented, and the code is now the source of truth.** The modules and tests live in `backend/` and were then hardened after the code review ([MARKET_DATA_REVIEW.md](MARKET_DATA_REVIEW.md)). The code blocks in this document and Appendix A show the first implementation (PR #5); they do **not** include the review fixes, which §16 summarizes. When this document and the code disagree, the code is right. Read the prose here for intent and contracts.
+
 **Verification.** All code here was run, not just written, on Python 3.12 with FastAPI 0.142.2 and massive 2.8.0:
 
 - The 57 tests in Appendix A pass with no network or API key. Each fix in §14 (F1–F6) was mutation-checked: putting the old behavior back makes its test fail.
@@ -11,7 +13,7 @@ The implementation spec for FinAlly's market data subsystem (PLAN.md §6): one i
 - The SSE endpoint was checked under uvicorn with curl.
 - The code blocks were extracted from this document and the suite re-run against them.
 
-Contents: 1 Requirements · 2 Architecture · 3 Module layout · 4 Data model · 5 Price cache · 6 Ticker symbols · 7 Interface · 8 Factory · 9 Simulator · 10 Massive source · 11 FastAPI integration · 12 Testing · 13 Implementation checklist · 14 Changes from the earlier drafts · 15 Known limitations · Appendix A Test suite
+Contents: 1 Requirements · 2 Architecture · 3 Module layout · 4 Data model · 5 Price cache · 6 Ticker symbols · 7 Interface · 8 Factory · 9 Simulator · 10 Massive source · 11 FastAPI integration · 12 Testing · 13 Implementation checklist · 14 Changes from the earlier drafts · 15 Known limitations · 16 Changes after the code review · Appendix A Test suite
 
 ## 1. Requirements
 
@@ -186,7 +188,7 @@ class PriceUpdate:
 
 | Field                | Meaning                                                                                                                                                     |
 | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `price`              | Latest price, rounded to cents                                                                                                                              |
+| `price`              | Latest price, rounded to cents (4 decimals below $1)                                                                                                        |
 | `previous_price`     | Price from the previous update (tick or poll). Drives `change` and `direction`.                                                                             |
 | `prev_close`         | Base for the daily change. Massive snapshot: previous session's close. Massive EOD: close of the session before. Simulator: the ticker's seed price.        |
 | `timestamp`          | Unix seconds when the cache received the update. Not the exchange time: Massive data can be 15 minutes old, and receive time keeps charts on a live x-axis. |
@@ -270,8 +272,8 @@ class PriceCache:
         self._changed = asyncio.Event()  # ...and give later waiters a fresh one
 ```
 
-- **`update()`** rounds to cents and makes the old price the new `previous_price`. When `prev_close` is not given, the stored one carries forward (the first update uses its own price).
-- **Invalid prices raise `ValueError`** (zero, negative, NaN, infinity). Neither source produces them in normal operation, but one NaN would serialize as `NaN`, which `JSON.parse` rejects, breaking the stream for every client.
+- **`update()`** rounds to cents (4 decimals below $1, so sub-dollar stocks keep their precision) and makes the old price the new `previous_price`. When `prev_close` is not given, or is unusable (zero, negative, NaN, infinity), the stored one carries forward (the first update uses its own price).
+- **Invalid prices raise `ValueError`** (zero, negative, NaN, infinity), checked **after** rounding, so a positive price that rounds to 0 is rejected too. Neither source produces them in normal operation, but one NaN would serialize as `NaN`, which `JSON.parse` rejects, breaking the stream for every client.
 - **`version`** goes up on every change. `wait_for_change(v)` returns as soon as `version != v`. Each change sets the current `asyncio.Event`, waking every waiter, and swaps in a fresh one. Setting an event is synchronous, so `update()` stays a plain method that sources can call in a loop. Waiters only run once the writer yields, so a simulator tick that updates ten tickers wakes the SSE stream once, after the whole tick.
 
 ## 6. Ticker Symbols — `tickers.py`
@@ -353,10 +355,10 @@ How each implementation behaves:
 | --------------------------- | ----------------------------------------------------- | -------------------------------------------- | ---------------------------------------- |
 | Updates                     | every 0.5s                                            | every `MASSIVE_POLL_SECONDS` (15)            | hourly; the data changes once a day      |
 | When `start()` returns      | every ticker priced (seed price)                      | priced from the first poll                   | priced from the latest EOD data          |
-| When `add_ticker()` returns | priced (seed price, or its last price if seen before) | priced (one snapshot call for that ticker)   | priced from stored EOD data, no API call |
+| When `add_ticker()` returns | priced (seed price, or its last price if seen before) | priced, unless the call takes over 3s or the API is failing (then the background poll prices it) | priced from stored EOD data, no API call |
 | `prev_close`                | seed price                                            | previous session's close (`prevDay.c`)       | close of the session before              |
 | Unknown ticker              | gets a generated price                                | never priced                                 | never priced                             |
-| API calls                   | none                                                  | 1 per poll, 1 per `add_ticker`               | ≤ 5 at startup, 2–4 per hour             |
+| API calls                   | none                                                  | 1 per poll, 1 per `add_ticker` or `sync_tickers` that adds tickers | ≤ 5 at startup, 2–4 per hour             |
 
 Contract for callers:
 
@@ -926,6 +928,8 @@ Backoff is `poll_seconds × 2^failures`, capped at 5 minutes: 30s, 60s, 120s, 24
 - **Why the walk starts at yesterday.** On the free plan a day's data only appears after the close. Whether Massive answers a same-day request with an empty result or a 403 could not be checked without a free key, so the walk skips today and also treats a 403 for any single day as "not available". The cost is that a new close appears at the first hourly refresh after midnight New York time, not right after the market closes.
 - **`us_market_today()`** approximates New York as UTC−5. That is never ahead of the real date (daylight time is UTC−4), and the walk only needs "not in the future", so the slim Docker image needs no time zone database.
 - **The key is passed explicitly** to `RESTClient`. The client's default reads the env var at import time, possibly before `.env` is loaded.
+- **New tickers never hold up a request for long.** `add_ticker` and `sync_tickers` price new tickers with one snapshot call between them and wait at most `ADD_WAIT_SECONDS` (3s) for it. A slower call finishes in the background and writes its prices when it returns. While the API is failing (`_failures > 0`) no call is made at all, and the background poll prices the tickers once the API recovers.
+- **One refresh at a time.** An `asyncio.Lock` serializes `_refresh`, so a background poll and an `add_ticker` never make overlapping calls, and a plan downgrade switches to EOD mode exactly once. A targeted refresh that finds EOD mode already on when it gets the lock serves its tickers from the stored closes, without a call.
 - **Snapshot price fallback order:** last trade, minute bar close, day bar close, previous close. Starter has no last trade, and bars are reset overnight, so early-morning polls fall back to `prevDay.c`.
 
 ### 10.6 Switching Plans
@@ -981,6 +985,10 @@ app.include_router(stream.router)
 ```
 
 Run a **single uvicorn worker** (the default). The cache and simulator live in process memory, so each extra worker would run its own simulator and show different prices.
+
+Run uvicorn with **`--timeout-graceful-shutdown 2`**, for example `uvicorn app.main:app --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 2` as the Docker `CMD`. SSE streams never end on their own, and on SIGTERM uvicorn waits for open connections before it runs the lifespan shutdown, with no timeout by default. Without the flag, a shutdown with any browser tab open hangs until the tab closes: `docker stop` ends in SIGKILL after 10s and `--reload` stalls. With it, open streams are cancelled after 2s and the lifespan shutdown still runs. `test_graceful_shutdown_timeout_closes_open_streams` covers this.
+
+`main.py` calls `logging.basicConfig(level=INFO)`. uvicorn configures only its own loggers, so without it the app's INFO lines (which source is running, polling recovered) never appear.
 
 ### 11.2 Dependencies — `dependencies.py`
 
@@ -1211,23 +1219,25 @@ async def health(source: MarketSourceDep) -> dict:
 
 ```bash
 cd backend
-uv run pytest    # 57 tests in about 3s; no network or API key needed
+uv run pytest    # 76 tests in about 3s; no network or API key needed
+uv run ruff check app tests && uv run ruff format --check app tests && uv run mypy app
 ```
 
 | File                | Covers                                                                                                                                                                                                                                                                                                                                                                                          |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `test_cache.py`     | previous price, direction and rounding; `prev_close` carry-forward; invalid prices; `version`; the SSE dict shape; `wait_for_change` (immediate return, wake-up on change)                                                                                                                                                                                                                      |
+| `test_cache.py`     | previous price, direction and rounding (4 decimals below $1, validated after rounding); unusable `prev_close` carrying forward; `prev_close` carry-forward; invalid prices; `version`; the SSE dict shape; `wait_for_change` (immediate return, wake-up on change)                                                                                                                                                                                                                      |
 | `test_interface.py` | `normalize_ticker`; factory selection and `MASSIVE_POLL_SECONDS` parsing; `sync_tickers`                                                                                                                                                                                                                                                                                                        |
-| `test_simulator.py` | unknown-ticker profiles; determinism with a seed; parked prices; volatility and correlations against the model (20k ticks, fixed seed); jump rate; source start, add, remove and stop                                                                                                                                                                                                           |
-| `test_massive.py`   | no hidden client retries; snapshot price fallback; 403 detection; one call per poll; immediate pricing on add; the in-flight removal race; free-plan EOD fallback (exact call sequence); holidays and 403 days; a single EOD session; the lookup cap; backoff and recovery; a downgrade while running; the free plan's one-minute retry floor; the loop surviving network and unexpected errors |
-| `test_stream.py`    | real uvicorn and httpx: headers, `retry`, full state on connect, an event per change, removed tickers dropping out                                                                                                                                                                                                                                                                              |
+| `test_simulator.py` | unknown-ticker profiles; determinism with a seed; parked prices, and `prev_close` staying at the seed after a re-add; a failing tick; one task after a second `start()`; idempotent `add_ticker`; volatility and correlations against the model (20k ticks, fixed seed); jump rate; source start, add, remove and stop                                                                                                                                                                                                           |
+| `test_massive.py`   | no hidden client retries; snapshot price fallback; 403 detection; one call per poll; immediate pricing on add; the in-flight removal race; free-plan EOD fallback (exact call sequence); holidays and 403 days; a single EOD session; the lookup cap; backoff and recovery; a downgrade while running; the free plan's one-minute retry floor; the loop surviving network and unexpected errors; `add_ticker` waiting at most 3s and making no call while failing; `sync_tickers` batching; a downgrade with concurrent adds; one poller after a second `start()`; `us_market_today()` |
+| `test_stream.py`    | real uvicorn and httpx: headers, `retry`, full state on connect, an event per change, removed tickers dropping out; shutdown with a client attached under `timeout_graceful_shutdown` |
+| `test_main.py`      | the lifespan starts the simulator and `/api/health` reports it; the source stops on shutdown |
 
 The Massive tests pass a `FakeClient` through the `client=` parameter, so they need no network. The statistical tests use fixed seeds and are deterministic. The full suite is in Appendix A.
 
 Manual check:
 
 ```bash
-uv run uvicorn app.main:app --port 8000
+uv run uvicorn app.main:app --port 8000 --timeout-graceful-shutdown 2
 curl -N localhost:8000/api/stream/prices    # an event every 0.5s with the simulator
 curl localhost:8000/api/health
 ```
@@ -1284,6 +1294,20 @@ Unchanged from MARKET_INTERFACE.md and MARKET_SIMULATOR.md: the `PriceUpdate` fi
 | EOD mode is sticky                               | After upgrading the plan, restart the app to get snapshots.                                                                                                                                                                      |
 | One process                                      | Cache and simulator live in memory, so run a single uvicorn worker.                                                                                                                                                              |
 | Not verified against a live free key             | The exact 403 bodies, for the snapshot endpoint and for same-day grouped requests. Detection is deliberately lenient, and the log line "Massive plan has no snapshot access" confirms the switch. Check once a key is available. |
+
+## 16. Changes after the Code Review
+
+From [MARKET_DATA_REVIEW.md](MARKET_DATA_REVIEW.md). The code in `backend/` has these; the code blocks above do not.
+
+| #   | Problem                                                                                                         | Change                                                                                                                                 |
+| --- | --------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| M1  | A shutdown with any SSE client attached hung until the client left                                               | Run uvicorn with `--timeout-graceful-shutdown 2` (§11.1, PLAN.md §11); covered by a test                                               |
+| M2  | On Massive, each new ticker could hold up a request for the 10s read timeout while the API was down               | `add_ticker`/`sync_tickers` make one batched call, wait at most 3s, and make no call while the API is failing (§10.5)                  |
+| L1  | The cache validated before rounding (a sub-cent price became 0.0) and never checked `prev_close` (NaN broke the SSE JSON) | Round first (4 decimals below $1), then validate; an unusable `prev_close` carries the stored one forward (§5)                         |
+| L2  | Concurrent refreshes during a plan downgrade could burst past the free plan's 5 calls/min                        | `asyncio.Lock` around `_refresh`; the downgrade switches to EOD once (§10.5)                                                            |
+| L3  | The app's INFO logs never appeared under uvicorn                                                                 | `logging.basicConfig(level=INFO)` in `main.py` (§11.1)                                                                                 |
+| T   | Behaviors without tests                                                                                          | 19 new tests (76 in all), including the lifespan and `/api/health`; all 11 mutation spot-checks in the review are now caught           |
+| N   | No lint, format or type-check config                                                                             | `ruff` (line length 120) and `mypy` in the dev group and configured in `pyproject.toml`; all clean                                      |
 
 ## Appendix A. Test Suite
 
