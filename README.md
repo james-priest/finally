@@ -25,17 +25,30 @@ Single Docker container serving everything on port 8000:
 
 ## Quick Start
 
+Requires Docker.
+
 ```bash
-# Clone and configure
-cp .env.example .env
-# Add your OPENROUTER_API_KEY to .env
-
-# Run with Docker
-docker build -t finally .
-docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
-
-# Open http://localhost:8000
+cp .env.example .env          # then set OPENROUTER_API_KEY
+scripts/start_mac.sh          # builds the image if needed, runs it, opens http://localhost:8000
+scripts/stop_mac.sh           # stops the container; data is kept
 ```
+
+Windows (PowerShell): `scripts\start_windows.ps1` and `scripts\stop_windows.ps1`.
+
+| Start option                    | Effect                                 |
+| ------------------------------- | -------------------------------------- |
+| `--build` / `-Build`            | Rebuild the image even if it exists    |
+| `--no-open` / `-NoOpen`         | Do not open the browser                |
+
+Without the scripts:
+
+```bash
+docker build -t finally .
+docker run -d --name finally -v finally-data:/app/db -p 8000:8000 --env-file .env finally
+# or: docker compose up --build
+```
+
+The SQLite database lives in the `finally-data` Docker volume and survives restarts. To reset it: `docker volume rm finally-data`.
 
 ## Environment Variables
 

@@ -1,0 +1,74 @@
+@import "tailwindcss";
+
+@theme {
+  --color-page: #0d1117;
+  --color-panel: #121922;
+  --color-raised: #1a2330;
+  --color-line: #242f3d;
+  --color-ink: #dbe2ea;
+  --color-ink-2: #9ba7b5;
+  --color-ink-3: #6b7888;
+  --color-up: #35c27f;
+  --color-down: #ef5d5a;
+  --color-accent: #ecad0a;
+  --color-brand: #209dd7;
+  --color-submit: #753991;
+  --color-submit-hover: #8a48a8;
+  --font-sans: "IBM Plex Sans Condensed", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+html,
+body {
+  background: var(--color-page);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-variant-numeric: tabular-nums;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 1px;
+}
+
+@keyframes flash-up {
+  from {
+    background-color: color-mix(in oklab, var(--color-up) 28%, transparent);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+@keyframes flash-down {
+  from {
+    background-color: color-mix(in oklab, var(--color-down) 28%, transparent);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+.flash-up {
+  animation: flash-up 500ms ease-out;
+}
+
+.flash-down {
+  animation: flash-down 500ms ease-out;
+}
+
+@keyframes pulse-dot {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.loading-dot {
+  animation: pulse-dot 1s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loading-dot {
+    animation: none;
+  }
+}

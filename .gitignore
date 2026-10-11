@@ -208,3 +208,17 @@ __marimo__/
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# FinAlly runtime and build artifacts
+db/*.db
+db/*.db-*
+frontend/node_modules/
+frontend/out/
+frontend/.next/
+backend/static/
+playwright-report/
+test-results/
+blob-report/
+
+# The Python template above ignores lib/; the frontend keeps source there
+!frontend/lib/

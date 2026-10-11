@@ -1,0 +1,36 @@
+# E2E run: app (fresh database, mock LLM) + Playwright runner.
+#   docker compose -f test/docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from playwright
+#   docker compose -f test/docker-compose.test.yml down -v
+services:
+  # Not "app": .app is an HSTS-preloaded TLD, so Chromium forces https://app.
+  finally-app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      LLM_MOCK: "true"
+      MASSIVE_API_KEY: ""
+      OPENROUTER_API_KEY: ""
+    # No named volume: the database starts empty on every run.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  playwright:
+    image: mcr.microsoft.com/playwright:v1.64.0-noble
+    depends_on:
+      finally-app:
+        condition: service_healthy
+    working_dir: /e2e
+    environment:
+      BASE_URL: http://finally-app:8000
+      CI: "true"
+    volumes:
+      - ./:/e2e
+      # Keep the container's Linux node_modules separate from the host's.
+      - /e2e/node_modules
+    ipc: host
+    init: true
+    command: ["sh", "-c", "npm ci && npx playwright test"]
