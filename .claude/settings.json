@@ -1,3 +1,11 @@
 {
-  "enabledPlugins": {}
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
+  "enabledPlugins": {
+    "playwright@anthropic-plugin-directory": true,
+    "frontend-design@claude-plugins-official": true,
+    "context7@anthropic-plugin-directory": true
+  },
+  "teammateMode": "in-process"
 }
